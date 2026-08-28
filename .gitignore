@@ -1,0 +1,12 @@
+target/
+*.class
+.idea/
+*.iml
+
+# VS Code workspace and local editor settings
+*.code-workspace
+.vscode/
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
