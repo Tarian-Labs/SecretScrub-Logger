@@ -20,7 +20,7 @@ public class SecretScrubLoggerExtension implements BurpExtension {
     public void initialize(MontoyaApi api) {
         api.extension().setName(EXTENSION_NAME);
 
-        PersistedObject persistedData = api.persistence().extensionData();
+        PersistedObject persistedData = loadPersistedData(api);
         Path configuredDirectory = loadConfiguredDirectory(persistedData);
         String configuredPrefix = loadConfiguredPrefix(persistedData);
 
@@ -36,13 +36,22 @@ public class SecretScrubLoggerExtension implements BurpExtension {
         api.logging().logToOutput(EXTENSION_NAME + " loaded. Logging in-scope traffic to " + logWriter.getDirectory());
     }
 
+    private PersistedObject loadPersistedData(MontoyaApi api) {
+        try {
+            return api.persistence().extensionData();
+        } catch (RuntimeException e) {
+            api.logging().logToError(EXTENSION_NAME + " could not access extension settings; using defaults for this session: " + e.getMessage());
+            return null;
+        }
+    }
+
     private Path loadConfiguredDirectory(PersistedObject persistedData) {
-        String saved = persistedData.getString(TrafficLoggerConfig.PERSISTED_DIRECTORY_KEY);
+        String saved = persistedData == null ? null : persistedData.getString(TrafficLoggerConfig.PERSISTED_DIRECTORY_KEY);
         return saved != null ? Paths.get(saved) : TrafficLoggerConfig.DEFAULT_LOG_DIRECTORY;
     }
 
     private String loadConfiguredPrefix(PersistedObject persistedData) {
-        String saved = persistedData.getString(TrafficLoggerConfig.PERSISTED_PREFIX_KEY);
+        String saved = persistedData == null ? null : persistedData.getString(TrafficLoggerConfig.PERSISTED_PREFIX_KEY);
         return saved != null ? saved : TrafficLoggerConfig.DEFAULT_FILE_PREFIX;
     }
 }
