@@ -1,0 +1,359 @@
+package secretscrublogger;
+
+import java.net.URLDecoder;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Removes sensitive values from HTTP requests/responses before they are persisted, returned
+ * through any API, or displayed anywhere, replacing each secret with a fixed {@link #REDACTED}
+ * placeholder. Headers, cookies, URL query parameters, and JSON/form-encoded bodies are parsed
+ * structurally so nested and array values are covered; unparseable or unrecognized bodies fall
+ * back to defensive text scanning. Key/header/parameter names are matched case-insensitively
+ * against a list of sensitive terms, and token-shaped values (JWTs, bearer tokens) are redacted
+ * even when found under a non-sensitive name.
+ */
+final class SecretRedactor {
+
+    static final String REDACTED = "[REDACTED]";
+
+    // Sensitive terms are matched as a "contains" check against the normalized (lowercased,
+    // separator-stripped) key/header/parameter name, so e.g. "accessToken" and "api_key" match.
+    private static final List<String> SENSITIVE_TERMS = List.of(
+            "authorization", "authentication", "token", "accesstoken", "refreshtoken", "idtoken",
+            "jwt", "bearer", "apikey", "secret", "password", "cookie", "session", "credential"
+    );
+
+    // Three base64url segments separated by periods: the shape of a JWT, wherever it appears.
+    private static final Pattern JWT_PATTERN =
+            Pattern.compile("[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}");
+
+    private static final Pattern BEARER_TOKEN_PATTERN =
+            Pattern.compile("(?i)(Bearer\\s+)([A-Za-z0-9\\-_.+/=]{8,})");
+
+    // Defensive fallback for bodies that cannot be structurally parsed: matches "key": "value" or
+    // key=value where the key contains a sensitive term, quoted or not.
+    private static final Pattern FALLBACK_KV_PATTERN = Pattern.compile(
+            "(?i)(\"?[\\w-]*(?:authorization|authenticat\\w*|accesstoken|refreshtoken|idtoken|token|jwt|"
+                    + "bearer|api[_-]?key|secret|password|cookie|session|credential)[\\w-]*\"?\\s*[:=]\\s*\"?)"
+                    + "([^\"'&,\\r\\n}]+)(\"?)");
+
+    private static final List<String> KNOWN_COOKIE_ATTRIBUTES = List.of(
+            "path", "domain", "expires", "maxage", "samesite", "secure", "httponly", "partitioned"
+    );
+
+    /**
+     * Redacts a raw HTTP request or response message (request/status line + headers + blank line
+     * + body).
+     */
+    String redact(String rawMessage) {
+        if (rawMessage == null) {
+            return null;
+        }
+        String[] split = splitHeadAndBody(rawMessage);
+        String head = split[0];
+        String separator = split[1];
+        String body = split[2];
+
+        String lineBreak = head.contains("\r\n") ? "\r\n" : "\n";
+        String[] lines = head.split(Pattern.quote(lineBreak), -1);
+
+        StringBuilder newHead = new StringBuilder(head.length());
+        String contentType = null;
+        for (int i = 0; i < lines.length; i++) {
+            String line = lines[i];
+            String newLine;
+            if (i == 0) {
+                newLine = redactFirstLine(line);
+            } else {
+                int colon = line.indexOf(':');
+                if (colon < 0) {
+                    newLine = line;
+                } else {
+                    String name = line.substring(0, colon).trim();
+                    String value = line.substring(colon + 1).strip();
+                    if (normalizeKey(name).equals("contenttype")) {
+                        contentType = value;
+                    }
+                    newLine = name + ": " + redactHeaderLine(name, value);
+                }
+            }
+            newHead.append(newLine);
+            if (i < lines.length - 1) {
+                newHead.append(lineBreak);
+            }
+        }
+
+        String newBody = redactBody(contentType, body);
+        return newHead + separator + newBody;
+    }
+
+    /** Redacts sensitive query parameters in a standalone URL or request-target for display/logging. */
+    String redactUrl(String url) {
+        if (url == null) {
+            return null;
+        }
+        int hashIdx = url.indexOf('#');
+        String beforeHash = hashIdx >= 0 ? url.substring(0, hashIdx) : url;
+        String fragment = hashIdx >= 0 ? url.substring(hashIdx) : "";
+        int queryIdx = beforeHash.indexOf('?');
+        if (queryIdx < 0) {
+            return beforeHash + fragment;
+        }
+        String base = beforeHash.substring(0, queryIdx);
+        String query = beforeHash.substring(queryIdx + 1);
+        return base + "?" + redactEncodedPairs(query, '&') + fragment;
+    }
+
+    private String redactFirstLine(String line) {
+        if (line.regionMatches(true, 0, "HTTP/", 0, 5)) {
+            // Status line: "HTTP/1.1 200 OK" - status code/reason are safe context, keep as-is.
+            return line;
+        }
+        int firstSpace = line.indexOf(' ');
+        int lastSpace = line.lastIndexOf(' ');
+        if (firstSpace < 0 || lastSpace <= firstSpace) {
+            return line;
+        }
+        String method = line.substring(0, firstSpace);
+        String target = line.substring(firstSpace + 1, lastSpace);
+        String version = line.substring(lastSpace + 1);
+        return method + " " + redactUrl(target) + " " + version;
+    }
+
+    private String redactHeaderLine(String name, String value) {
+        String norm = normalizeKey(name);
+        if (norm.equals("cookie") || norm.equals("setcookie")) {
+            return redactCookieHeaderValue(norm, value);
+        }
+        if (norm.equals("authorization") || norm.equals("authentication")) {
+            return redactSchemeValue(value);
+        }
+        if (isSensitiveKey(name)) {
+            return REDACTED;
+        }
+        return scanAndRedactTokens(value);
+    }
+
+    /** Keeps a leading auth scheme word (e.g. "Bearer") as safe context, redacts the credential. */
+    private String redactSchemeValue(String value) {
+        int sp = value.indexOf(' ');
+        if (sp > 0) {
+            String scheme = value.substring(0, sp);
+            boolean allLetters = !scheme.isEmpty() && scheme.chars().allMatch(Character::isLetter);
+            if (allLetters) {
+                return scheme + " " + REDACTED;
+            }
+        }
+        return REDACTED;
+    }
+
+    private String redactCookieHeaderValue(String norm, String value) {
+        boolean isSetCookie = norm.equals("setcookie");
+        String[] parts = value.split(";", -1);
+        StringBuilder sb = new StringBuilder(value.length());
+        for (int i = 0; i < parts.length; i++) {
+            if (i > 0) {
+                sb.append(';');
+            }
+            String part = parts[i];
+            String trimmed = part.strip();
+            if (trimmed.isEmpty()) {
+                sb.append(part);
+                continue;
+            }
+            if (isSetCookie && i > 0 && isKnownCookieAttribute(trimmed)) {
+                sb.append(part);
+                continue;
+            }
+            int eq = trimmed.indexOf('=');
+            String leadingWs = part.substring(0, part.length() - part.stripLeading().length());
+            if (eq < 0) {
+                sb.append(part);
+            } else {
+                String cookieName = trimmed.substring(0, eq);
+                sb.append(leadingWs).append(cookieName).append('=').append(REDACTED);
+            }
+        }
+        return sb.toString();
+    }
+
+    private boolean isKnownCookieAttribute(String part) {
+        int eq = part.indexOf('=');
+        String name = eq >= 0 ? part.substring(0, eq) : part;
+        return KNOWN_COOKIE_ATTRIBUTES.contains(normalizeKey(name));
+    }
+
+    private String redactBody(String contentType, String body) {
+        if (body == null || body.isEmpty()) {
+            return body;
+        }
+        String ct = contentType == null ? "" : contentType.toLowerCase(Locale.ROOT);
+        String leading = body.stripLeading();
+        boolean looksJson = !leading.isEmpty() && (leading.charAt(0) == '{' || leading.charAt(0) == '[');
+
+        if (ct.contains("json") || (ct.isEmpty() && looksJson)) {
+            try {
+                Object parsed = MiniJson.parse(body);
+                return MiniJson.write(redactJsonValue(parsed));
+            } catch (MiniJson.ParseException e) {
+                return fallbackTextRedact(body);
+            }
+        }
+        if (ct.contains("x-www-form-urlencoded")) {
+            return redactEncodedPairs(body, '&');
+        }
+        return fallbackTextRedact(body);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object redactJsonValue(Object node) {
+        if (node instanceof Map) {
+            Map<String, Object> in = (Map<String, Object>) node;
+            Map<String, Object> out = new LinkedHashMap<>(in.size());
+            for (Map.Entry<String, Object> entry : in.entrySet()) {
+                if (isSensitiveKey(entry.getKey())) {
+                    out.put(entry.getKey(), REDACTED);
+                } else {
+                    out.put(entry.getKey(), redactJsonValue(entry.getValue()));
+                }
+            }
+            return out;
+        }
+        if (node instanceof List) {
+            List<Object> in = (List<Object>) node;
+            List<Object> out = new ArrayList<>(in.size());
+            for (Object item : in) {
+                out.add(redactJsonValue(item));
+            }
+            return out;
+        }
+        if (node instanceof String) {
+            return scanAndRedactTokens((String) node);
+        }
+        return node;
+    }
+
+    /** Redacts sensitive-named parameters in "a=1&b=2" data, used for both query strings and forms. */
+    private String redactEncodedPairs(String data, char separator) {
+        if (data.isEmpty()) {
+            return data;
+        }
+        String[] pairs = data.split(Pattern.quote(String.valueOf(separator)), -1);
+        StringBuilder sb = new StringBuilder(data.length());
+        for (int i = 0; i < pairs.length; i++) {
+            if (i > 0) {
+                sb.append(separator);
+            }
+            sb.append(redactEncodedPair(pairs[i]));
+        }
+        return sb.toString();
+    }
+
+    private String redactEncodedPair(String pair) {
+        if (pair.isEmpty()) {
+            return pair;
+        }
+        int eq = pair.indexOf('=');
+        if (eq < 0) {
+            return pair;
+        }
+        String rawName = pair.substring(0, eq);
+        String rawValue = pair.substring(eq + 1);
+        String decodedName = decodeUrlComponent(rawName);
+        if (isSensitiveKey(decodedName)) {
+            return rawName + "=" + REDACTED;
+        }
+        String decodedValue = decodeUrlComponent(rawValue);
+        String scanned = scanAndRedactTokens(decodedValue);
+        if (!scanned.equals(decodedValue)) {
+            return rawName + "=" + encodeUrlComponent(scanned);
+        }
+        return pair;
+    }
+
+    /** Redacts JWT-shaped or bearer-prefixed values inside otherwise non-sensitive text. */
+    private String scanAndRedactTokens(String value) {
+        if (value == null || value.isEmpty()) {
+            return value;
+        }
+        if (JWT_PATTERN.matcher(value).matches()) {
+            return REDACTED;
+        }
+        String result = BEARER_TOKEN_PATTERN.matcher(value)
+                .replaceAll(mr -> Matcher.quoteReplacement(mr.group(1) + REDACTED));
+        result = JWT_PATTERN.matcher(result).replaceAll(Matcher.quoteReplacement(REDACTED));
+        return result;
+    }
+
+    /** Defensive text-based redaction used only when a body cannot be structurally parsed. */
+    private String fallbackTextRedact(String text) {
+        String result = FALLBACK_KV_PATTERN.matcher(text)
+                .replaceAll(mr -> Matcher.quoteReplacement(mr.group(1) + REDACTED + mr.group(3)));
+        result = BEARER_TOKEN_PATTERN.matcher(result)
+                .replaceAll(mr -> Matcher.quoteReplacement(mr.group(1) + REDACTED));
+        result = JWT_PATTERN.matcher(result).replaceAll(Matcher.quoteReplacement(REDACTED));
+        return result;
+    }
+
+    private static String decodeUrlComponent(String s) {
+        try {
+            return URLDecoder.decode(s, StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException e) {
+            return s;
+        }
+    }
+
+    private static String encodeUrlComponent(String s) {
+        return URLEncoder.encode(s, StandardCharsets.UTF_8);
+    }
+
+    private static String normalizeKey(String key) {
+        if (key == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(key.length());
+        for (int i = 0; i < key.length(); i++) {
+            char c = key.charAt(i);
+            if (Character.isLetterOrDigit(c)) {
+                sb.append(Character.toLowerCase(c));
+            }
+        }
+        return sb.toString();
+    }
+
+    private static boolean isSensitiveKey(String key) {
+        String normalized = normalizeKey(key);
+        if (normalized.isEmpty()) {
+            return false;
+        }
+        for (String term : SENSITIVE_TERMS) {
+            if (normalized.contains(term)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Splits a raw HTTP message into {head, separator, body}. The separator is empty when no body is present.
+     */
+    private String[] splitHeadAndBody(String raw) {
+        int crlf = raw.indexOf("\r\n\r\n");
+        int lf = raw.indexOf("\n\n");
+        if (crlf >= 0 && (lf < 0 || crlf <= lf)) {
+            return new String[]{raw.substring(0, crlf), "\r\n\r\n", raw.substring(crlf + 4)};
+        }
+        if (lf >= 0) {
+            return new String[]{raw.substring(0, lf), "\n\n", raw.substring(lf + 2)};
+        }
+        return new String[]{raw, "", ""};
+    }
+}
