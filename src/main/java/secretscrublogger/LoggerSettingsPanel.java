@@ -124,7 +124,9 @@ final class LoggerSettingsPanel extends JPanel {
         try {
             Path newDirectory = Paths.get(text);
             logWriter.setDirectory(newDirectory);
-            persistedData.setString(TrafficLoggerConfig.PERSISTED_DIRECTORY_KEY, newDirectory.toString());
+            if (persistedData != null) {
+                persistedData.setString(TrafficLoggerConfig.PERSISTED_DIRECTORY_KEY, newDirectory.toString());
+            }
             directoryField.setText(newDirectory.toString());
             showStatus("Now logging to: " + newDirectory, false);
             api.logging().logToOutput(SecretScrubLoggerExtension.EXTENSION_NAME + " log directory changed to " + newDirectory);
@@ -146,7 +148,9 @@ final class LoggerSettingsPanel extends JPanel {
         }
         try {
             logWriter.startNewFile(prefix);
-            persistedData.setString(TrafficLoggerConfig.PERSISTED_PREFIX_KEY, prefix);
+            if (persistedData != null) {
+                persistedData.setString(TrafficLoggerConfig.PERSISTED_PREFIX_KEY, prefix);
+            }
             prefixField.setText(prefix);
             showStatus("Started new file: " + logWriter.getDirectory().resolve(prefix + "-####.jsonl"), false);
             api.logging().logToOutput(SecretScrubLoggerExtension.EXTENSION_NAME + " started a new log file with prefix \"" + prefix + "\"");
