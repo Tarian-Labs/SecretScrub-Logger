@@ -23,6 +23,9 @@ final class TrafficLoggerConfig {
     // Key used to persist the user-configured file prefix across Burp restarts.
     static final String PERSISTED_PREFIX_KEY = "secretscrublogger.prefix";
 
+    // Comma-separated custom field names that the user wants treated as sensitive.
+    static final String PERSISTED_CUSTOM_FIELDS_KEY = "secretscrublogger.customFields";
+
     static final Path DEFAULT_LOG_DIRECTORY = Paths.get(System.getProperty("secretscrublogger.dir", "C:\\SecretScrubLogs"));
 
     static final String DEFAULT_FILE_PREFIX = "secretscrub";

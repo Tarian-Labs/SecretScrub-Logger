@@ -28,15 +28,19 @@ final class LoggerSettingsPanel extends JPanel {
 
     private final MontoyaApi api;
     private final JsonlLogWriter logWriter;
+    private final SecretRedactor redactor;
     private final PersistedObject persistedData;
     private final JTextField directoryField;
     private final JTextField prefixField;
+    private final JTextField customFieldsField;
     private final JLabel statusLabel;
 
-    LoggerSettingsPanel(MontoyaApi api, JsonlLogWriter logWriter, PersistedObject persistedData) {
+    LoggerSettingsPanel(MontoyaApi api, JsonlLogWriter logWriter, SecretRedactor redactor,
+                        PersistedObject persistedData, String configuredCustomFields) {
         super(new GridBagLayout());
         this.api = api;
         this.logWriter = logWriter;
+        this.redactor = redactor;
         this.persistedData = persistedData;
 
         directoryField = new JTextField(logWriter.getDirectory().toString(), 40);
@@ -44,11 +48,14 @@ final class LoggerSettingsPanel extends JPanel {
         JButton applyDirectoryButton = new JButton("Apply Directory");
         prefixField = new JTextField(logWriter.getFilePrefix(), 20);
         JButton startNewFileButton = new JButton("Start New File");
+        customFieldsField = new JTextField(configuredCustomFields, 40);
+        JButton applyCustomFieldsButton = new JButton("Apply Custom Fields");
         statusLabel = new JLabel(" ");
 
         browseButton.addActionListener(e -> browseForDirectory());
         applyDirectoryButton.addActionListener(e -> applyDirectory());
         startNewFileButton.addActionListener(e -> startNewFile());
+        applyCustomFieldsButton.addActionListener(e -> applyCustomFields());
 
         GridBagConstraints c = new GridBagConstraints();
         c.insets = new Insets(8, 8, 4, 8);
@@ -87,15 +94,52 @@ final class LoggerSettingsPanel extends JPanel {
         c.weightx = 0;
         add(startNewFileButton, c);
 
-        c.gridx = 1;
+        c.gridx = 0;
         c.gridy = 4;
+        add(new JLabel("Custom sensitive fields:"), c);
+
+        c.gridx = 1;
+        c.fill = GridBagConstraints.HORIZONTAL;
+        c.weightx = 1;
+        add(customFieldsField, c);
+
+        c.gridx = 2;
+        c.fill = GridBagConstraints.NONE;
+        c.weightx = 0;
+        add(applyCustomFieldsButton, c);
+
+        c.gridx = 1;
+        c.gridy = 5;
+        add(new JLabel("Comma-separated, e.g. usr_pwd, privateNote"), c);
+
+        c.gridy = 6;
         add(statusLabel, c);
 
         c.gridx = 0;
-        c.gridy = 5;
+        c.gridy = 7;
         c.gridwidth = 3;
         c.weighty = 1;
         add(Box.createGlue(), c);
+    }
+
+    private void applyCustomFields() {
+        String value = customFieldsField.getText().trim();
+        try {
+            java.util.List<String> fields = SecretScrubLoggerExtension.parseCustomFields(value);
+            redactor.setCustomSensitiveFields(fields);
+            String persistedValue = String.join(", ", fields);
+            if (persistedData != null) {
+                persistedData.setString(TrafficLoggerConfig.PERSISTED_CUSTOM_FIELDS_KEY, persistedValue);
+            }
+            customFieldsField.setText(persistedValue);
+            showStatus("Applied " + fields.size() + " custom sensitive field(s).", false);
+            api.logging().logToOutput(SecretScrubLoggerExtension.EXTENSION_NAME
+                    + " updated custom sensitive fields (" + fields.size() + ")");
+        } catch (RuntimeException e) {
+            showStatus("Failed to apply custom fields: " + e.getMessage(), true);
+            api.logging().logToError(SecretScrubLoggerExtension.EXTENSION_NAME
+                    + " failed to update custom sensitive fields: " + e.getMessage());
+        }
     }
 
     private void browseForDirectory() {

@@ -157,4 +157,59 @@ class SecretRedactorTest {
         assertFalse(result.contains(secret.substring(0, 8)), "no prefix leakage");
         assertFalse(result.contains(secret.substring(secret.length() - 8)), "no suffix leakage");
     }
+
+    @Test
+    void redactsConfiguredCustomFieldInRequestAndResponseJson() {
+        redactor.setCustomSensitiveFields(java.util.List.of("usr_pwd"));
+        String rawRequest = "POST /login HTTP/1.1\r\nContent-Type: application/json\r\n\r\n"
+                + "{\"username\":\"alice\",\"usr_pwd\":\"custom-request-secret\"}";
+        String rawResponse = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"
+                + "{\"USR-PWD\":\"custom-response-secret\",\"result\":\"ok\"}";
+
+        String requestResult = redactor.redact(rawRequest);
+        String responseResult = redactor.redact(rawResponse);
+
+        assertFalse(requestResult.contains("custom-request-secret"));
+        assertFalse(responseResult.contains("custom-response-secret"));
+        assertTrue(requestResult.contains("\"usr_pwd\":\"" + SecretRedactor.REDACTED + "\""));
+        assertTrue(responseResult.contains("\"USR-PWD\":\"" + SecretRedactor.REDACTED + "\""));
+        assertTrue(requestResult.contains("\"username\":\"alice\""));
+        assertTrue(responseResult.contains("\"result\":\"ok\""));
+    }
+
+    @Test
+    void customFieldUsesExactNormalizedMatchingAndCanBeCleared() {
+        redactor.setCustomSensitiveFields(java.util.List.of("usr_pwd"));
+        String raw = "POST / HTTP/1.1\r\nContent-Type: application/json\r\n\r\n"
+                + "{\"usrPwd\":\"hide-me\",\"usr_pwd_hint\":\"keep-me\"}";
+
+        String configuredResult = redactor.redact(raw);
+        assertFalse(configuredResult.contains("hide-me"));
+        assertTrue(configuredResult.contains("keep-me"));
+
+        redactor.setCustomSensitiveFields(java.util.List.of());
+        String clearedResult = redactor.redact(raw);
+        assertTrue(clearedResult.contains("hide-me"));
+    }
+
+    @Test
+    void redactsCustomFieldAcrossHeaderQueryFormAndMalformedResponse() {
+        redactor.setCustomSensitiveFields(java.util.List.of("usr_pwd"));
+        String rawRequest = "POST /login?usr_pwd=query-secret&safe=yes HTTP/1.1\r\n"
+                + "Usr-Pwd: header-secret\r\n"
+                + "Content-Type: application/x-www-form-urlencoded\r\n\r\n"
+                + "usr_pwd=form-secret&safe=visible";
+        String malformedResponse = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"
+                + "{\"usr_pwd\":\"response-secret\", broken";
+
+        String requestResult = redactor.redact(rawRequest);
+        String responseResult = redactor.redact(malformedResponse);
+
+        for (String secret : java.util.List.of(
+                "query-secret", "header-secret", "form-secret", "response-secret")) {
+            assertFalse((requestResult + responseResult).contains(secret), secret + " must be redacted");
+        }
+        assertTrue(requestResult.contains("safe=yes"));
+        assertTrue(requestResult.contains("safe=visible"));
+    }
 }

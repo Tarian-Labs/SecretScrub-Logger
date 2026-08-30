@@ -8,6 +8,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Collection;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -45,9 +47,29 @@ final class SecretRedactor {
                     + "bearer|api[_-]?key|secret|password|cookie|session|credential)[\\w-]*\"?\\s*[:=]\\s*\"?)"
                     + "([^\"'&,\\r\\n}]+)(\"?)");
 
+    private static final Pattern GENERIC_FALLBACK_KV_PATTERN = Pattern.compile(
+            "(?i)(\"?([\\w-]+)\"?\\s*[:=]\\s*\"?)([^\"'&,\\r\\n}]+)(\"?)");
+
     private static final List<String> KNOWN_COOKIE_ATTRIBUTES = List.of(
             "path", "domain", "expires", "maxage", "samesite", "secure", "httponly", "partitioned"
     );
+
+    private volatile Set<String> customSensitiveFields = Set.of();
+
+    void setCustomSensitiveFields(Collection<String> fields) {
+        if (fields == null || fields.isEmpty()) {
+            customSensitiveFields = Set.of();
+            return;
+        }
+        java.util.HashSet<String> normalized = new java.util.HashSet<>();
+        for (String field : fields) {
+            String value = normalizeKey(field);
+            if (!value.isEmpty()) {
+                normalized.add(value);
+            }
+        }
+        customSensitiveFields = Set.copyOf(normalized);
+    }
 
     /**
      * Redacts a raw HTTP request or response message (request/status line + headers + blank line
@@ -297,6 +319,12 @@ final class SecretRedactor {
     private String fallbackTextRedact(String text) {
         String result = FALLBACK_KV_PATTERN.matcher(text)
                 .replaceAll(mr -> Matcher.quoteReplacement(mr.group(1) + REDACTED + mr.group(3)));
+        result = GENERIC_FALLBACK_KV_PATTERN.matcher(result).replaceAll(mr -> {
+            if (!customSensitiveFields.contains(normalizeKey(mr.group(2)))) {
+                return Matcher.quoteReplacement(mr.group());
+            }
+            return Matcher.quoteReplacement(mr.group(1) + REDACTED + mr.group(4));
+        });
         result = BEARER_TOKEN_PATTERN.matcher(result)
                 .replaceAll(mr -> Matcher.quoteReplacement(mr.group(1) + REDACTED));
         result = JWT_PATTERN.matcher(result).replaceAll(Matcher.quoteReplacement(REDACTED));
@@ -329,10 +357,13 @@ final class SecretRedactor {
         return sb.toString();
     }
 
-    private static boolean isSensitiveKey(String key) {
+    private boolean isSensitiveKey(String key) {
         String normalized = normalizeKey(key);
         if (normalized.isEmpty()) {
             return false;
+        }
+        if (customSensitiveFields.contains(normalized)) {
+            return true;
         }
         for (String term : SENSITIVE_TERMS) {
             if (normalized.contains(term)) {

@@ -1,5 +1,6 @@
 target/
 *.class
+.mvn/wrapper/maven-wrapper.jar
 .idea/
 *.iml
 
@@ -10,3 +11,10 @@ target/
 # Operating-system metadata
 .DS_Store
 Thumbs.db
+.obsidian/
+
+# Captured traffic may still contain sensitive data
+*.jsonl
+
+# Local AI-agent instructions
+AGENTS.md
