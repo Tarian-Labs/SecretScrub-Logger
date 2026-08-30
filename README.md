@@ -6,7 +6,7 @@ Working with AI is allowing penetration testers to test applications far more co
 
 We designed this Burp Suite plugin to redact as many secrets as possible by default. If it misses something application-specific, you can add custom fields to the redaction filter. If it redacts information that you genuinely need, you can explicitly exclude named fields from redaction.
 
-Once you are satisfied that only benign data is being recorded, you can upload the files directly through a chat interface or, better still, create a Claude Code or Codex project—or a VS Code workspace—that includes the log output directory. That allows your chosen AI to query the logs directly.
+Once you are satisfied that only benign data is being recorded, you can upload the files directly through a chat interface or, better still, create a Claude Code or Codex project, or a VS Code workspace that includes the log output directory. That allows your chosen AI to query the logs directly.
 
 **Important:** We make no warranty, express or implied, that SecretScrub will identify or redact every secret. It is the tester's responsibility to inspect the logs and ensure the data is safe before sending it to an AI provider. SecretScrub is not designed to identify or redact PII, so please make sure you are permitted to process and share any PII contained in the logs.
 
