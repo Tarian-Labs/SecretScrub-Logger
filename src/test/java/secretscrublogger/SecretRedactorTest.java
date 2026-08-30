@@ -2,6 +2,7 @@ package secretscrublogger;
 
 import org.junit.jupiter.api.Test;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -16,6 +17,25 @@ class SecretRedactorTest {
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
 
     private final SecretRedactor redactor = new SecretRedactor();
+
+    @Test
+    void reportsIntroducedRedactionMarkersWithoutCountingExistingPlaceholders() {
+        String raw = "POST /login?token=query-secret&safe=yes HTTP/1.1\r\n"
+                + "Authorization: Bearer header-secret-value\r\n"
+                + "Content-Type: application/json\r\n\r\n"
+                + "{\"password\":\"body-secret\",\"note\":\"[REDACTED]\"}";
+
+        SecretRedactor.RedactionResult result = redactor.redactWithMetadata(raw);
+        SecretRedactor.RedactionResult urlResult = redactor.redactUrlWithMetadata(
+                "https://example.com/login?token=query-secret&safe=yes");
+
+        assertEquals(3, result.redactionCount());
+        assertEquals(1, urlResult.redactionCount());
+        assertFalse(result.text().contains("query-secret"));
+        assertFalse(result.text().contains("header-secret-value"));
+        assertFalse(result.text().contains("body-secret"));
+        assertTrue(result.text().contains("\"note\":\"[REDACTED]\""));
+    }
 
     @Test
     void redactsAuthorizationBearerHeaderButKeepsScheme() {
@@ -146,6 +166,28 @@ class SecretRedactorTest {
     }
 
     @Test
+    void redactsSensitiveFieldsInsideEscapedFrameworkResponseData() {
+        String escapedQuote = "\\" + "\"";
+        String doubleEscapedQuote = "\\" + escapedQuote;
+        String body = "<script>self.__next_f.push([1,\"__PAGE__?{"
+                + escapedQuote + "token" + escapedQuote + ":"
+                + escapedQuote + "escaped-query-secret" + escapedQuote + ","
+                + escapedQuote + "mode" + escapedQuote + ":"
+                + escapedQuote + "positive" + escapedQuote + "}\"]);</script>"
+                + "<script>{"
+                + doubleEscapedQuote + "apiKey" + doubleEscapedQuote + ":"
+                + doubleEscapedQuote + "double-escaped-secret" + doubleEscapedQuote
+                + "}</script>";
+        String raw = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n\r\n" + body;
+
+        String result = redactor.redact(raw);
+
+        assertFalse(result.contains("escaped-query-secret"));
+        assertFalse(result.contains("double-escaped-secret"));
+        assertTrue(result.contains("positive"), "ordinary escaped fields must be preserved");
+    }
+
+    @Test
     void neverLeaksPartialTokenPrefixOrSuffix() {
         String secret = "test-token-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         String body = "{\"apiKey\":\"" + secret + "\"}";
@@ -193,6 +235,125 @@ class SecretRedactorTest {
     }
 
     @Test
+    void configuredExclusionsDoNothingUntilBypassIsEnabled() {
+        redactor.setExcludedFields(java.util.List.of("token", "password", "authorization"));
+        String raw = "POST /login?token=query-secret HTTP/1.1\r\n"
+                + "Authorization: Bearer header-secret-value\r\n"
+                + "Content-Type: application/json\r\n\r\n"
+                + "{\"password\":\"body-secret-value\"}";
+
+        String result = redactor.redact(raw);
+
+        for (String secret : java.util.List.of(
+                "query-secret", "header-secret-value", "body-secret-value")) {
+            assertFalse(result.contains(secret));
+        }
+        assertFalse(redactor.exclusionConfig().enabled());
+        assertEquals(3, redactor.exclusionConfig().fields().size());
+    }
+
+    @Test
+    void enabledExclusionsBypassHeaderQueryCookieJsonAndFormRedactionExactly() {
+        redactor.setCustomSensitiveFields(java.util.List.of("usr_pwd"));
+        redactor.setExcludedFields(java.util.List.of("usr_pwd", "token"));
+        redactor.setExclusionsEnabled(true);
+        String excludedJwt = JWT;
+        String request = "POST /login?token=" + excludedJwt
+                + "&token_hint=control-query-secret HTTP/1.1\r\n"
+                + "Usr-Pwd: Bearer EXCLUDED-HEADER-SECRET-123456789\r\n"
+                + "Cookie: usr_pwd=EXCLUDED-COOKIE-SECRET-123456789; sid=control-cookie-secret\r\n"
+                + "Content-Type: application/json\r\n\r\n"
+                + "{\"USR-PWD\":{\"token\":\"EXCLUDED-NESTED-SECRET-123456789\"},"
+                + "\"token_hint\":\"control-json-secret\"}";
+        String form = "POST /form HTTP/1.1\r\n"
+                + "Content-Type: application/x-www-form-urlencoded\r\n\r\n"
+                + "usrPwd=EXCLUDED-FORM-SECRET-123456789&password=control-form-secret";
+
+        String requestResult = redactor.redact(request);
+        String formResult = redactor.redact(form);
+
+        for (String preserved : java.util.List.of(
+                excludedJwt,
+                "EXCLUDED-HEADER-SECRET-123456789",
+                "EXCLUDED-COOKIE-SECRET-123456789",
+                "EXCLUDED-NESTED-SECRET-123456789",
+                "EXCLUDED-FORM-SECRET-123456789")) {
+            assertTrue((requestResult + formResult).contains(preserved),
+                    preserved + " should be intentionally preserved");
+        }
+        for (String redacted : java.util.List.of(
+                "control-query-secret", "control-cookie-secret",
+                "control-json-secret", "control-form-secret")) {
+            assertFalse((requestResult + formResult).contains(redacted),
+                    redacted + " must remain redacted");
+        }
+    }
+
+    @Test
+    void enabledExclusionsBypassMultipartXmlAndMalformedFallbackScanning() {
+        redactor.setExcludedFields(java.util.List.of("usr_pwd", "private_token"));
+        redactor.setExclusionsEnabled(true);
+        String multipartSecret = "EXCLUDED-MULTIPART-SECRET-123456789";
+        String boundary = "SecretScrubExclusionBoundary";
+        String multipart = "POST /upload HTTP/1.1\r\n"
+                + "Content-Type: multipart/form-data; boundary=" + boundary + "\r\n\r\n"
+                + "--" + boundary + "\r\n"
+                + "Content-Disposition: form-data; name=\"usr_pwd\"\r\n\r\n"
+                + multipartSecret + "\r\n--" + boundary + "--\r\n";
+        String xmlElementSecret = JWT;
+        String xmlAttributeSecret = "EXCLUDED-XML-ATTRIBUTE-SECRET-123456789";
+        String xml = "POST /xml HTTP/1.1\r\nContent-Type: application/xml\r\n\r\n"
+                + "<request private_token=\"" + xmlAttributeSecret + "\">"
+                + "<usr_pwd>" + xmlElementSecret + "</usr_pwd>"
+                + "<password>control-xml-secret</password></request>";
+        String malformedSecret = "EXCLUDED-MALFORMED-SECRET-123456789";
+        String malformed = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"
+                + "{\"usr_pwd\":\"" + malformedSecret + "\","
+                + "\"password\":\"control-malformed-secret\", broken";
+        String escapedSecret = "EXCLUDED-ESCAPED-SECRET-123456789";
+        String escaped = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n"
+                + "<script>{\\\"usr_pwd\\\":\\\"" + escapedSecret + "\\\","
+                + "\\\"token\\\":\\\"control-escaped-secret\\\"}</script>";
+
+        String output = redactor.redact(multipart) + redactor.redact(xml)
+                + redactor.redact(malformed) + redactor.redact(escaped);
+
+        for (String preserved : java.util.List.of(
+                multipartSecret, xmlElementSecret, xmlAttributeSecret,
+                malformedSecret, escapedSecret)) {
+            assertTrue(output.contains(preserved), preserved + " should be intentionally preserved");
+        }
+        for (String redacted : java.util.List.of(
+                "control-xml-secret", "control-malformed-secret", "control-escaped-secret")) {
+            assertFalse(output.contains(redacted), redacted + " must remain redacted");
+        }
+    }
+
+    @Test
+    void strictSafetyStillFailsClosedWhenRedactionBypassIsEnabled() {
+        redactor.setExcludedFields(java.util.List.of("usr_pwd", "token", "x-private-id"));
+        redactor.setExclusionsEnabled(true);
+        String querySecret = "STRICT-BYPASS-QUERY-SECRET-123456789";
+        String headerSecret = "STRICT-BYPASS-HEADER-SECRET-123456789";
+        String bodySecret = "STRICT-BYPASS-BODY-SECRET-123456789";
+        String raw = "POST /strict?token=" + querySecret + " HTTP/1.1\r\n"
+                + "X-Private-ID: " + headerSecret + "\r\n"
+                + "Content-Type: application/json\r\n\r\n"
+                + "{\"usr_pwd\":\"" + bodySecret + "\"}";
+
+        TrafficLoggerHttpHandler.PreparedMessage result =
+                TrafficLoggerHttpHandler.prepareMessage(raw, redactor, false, true);
+
+        for (String secret : java.util.List.of(querySecret, headerSecret, bodySecret)) {
+            assertFalse(result.text().contains(secret));
+            assertFalse(result.text().contains(secret.substring(0, 8)));
+            assertFalse(result.text().contains(secret.substring(secret.length() - 8)));
+        }
+        assertTrue(result.bodyOmitted());
+        assertTrue(result.text().endsWith("[OMITTED BY STRICT SAFETY MODE]"));
+    }
+
+    @Test
     void redactsCustomFieldAcrossHeaderQueryFormAndMalformedResponse() {
         redactor.setCustomSensitiveFields(java.util.List.of("usr_pwd"));
         String rawRequest = "POST /login?usr_pwd=query-secret&safe=yes HTTP/1.1\r\n"
@@ -211,5 +372,94 @@ class SecretRedactorTest {
         }
         assertTrue(requestResult.contains("safe=yes"));
         assertTrue(requestResult.contains("safe=visible"));
+    }
+
+    @Test
+    void redactsCommonCsrfKeyAndShortExactSensitiveKeys() {
+        String raw = "POST /verify HTTP/1.1\r\nContent-Type: application/json\r\n\r\n"
+                + "{\"_csrf\":\"csrf-secret\",\"client_secret\":\"client-secret\","
+                + "\"otp\":\"123456\",\"pin\":\"4321\",\"shipping\":\"preserve-me\"}";
+
+        String result = redactor.redact(raw);
+
+        for (String secret : java.util.List.of("csrf-secret", "client-secret", "123456", "4321")) {
+            assertFalse(result.contains(secret), secret + " must be redacted");
+        }
+        assertTrue(result.contains("\"shipping\":\"preserve-me\""));
+    }
+
+    @Test
+    void redactsSecretFollowingSensitiveUrlPathMarkerAndJwtSegments() {
+        String resetSecret = "reset-value-ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        String raw = "GET /reset-password/" + resetSecret + "/confirm?view=full HTTP/1.1\r\n"
+                + "Host: example.com\r\n\r\n";
+
+        String result = redactor.redact(raw);
+        String jwtUrl = redactor.redactUrl("https://example.com/download/" + JWT + "?safe=yes");
+
+        assertFalse(result.contains(resetSecret));
+        assertTrue(result.contains("GET /reset-password/" + SecretRedactor.REDACTED
+                + "/confirm?view=full HTTP/1.1"));
+        assertFalse(jwtUrl.contains(JWT));
+        assertTrue(jwtUrl.contains("/download/" + SecretRedactor.REDACTED + "?safe=yes"));
+    }
+
+    @Test
+    void preservesOrdinaryUrlPathSegments() {
+        String raw = "GET /users/alice/profile?tab=settings HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+        String result = redactor.redact(raw);
+
+        assertTrue(result.contains("/users/alice/profile?tab=settings"));
+    }
+
+    @Test
+    void redactsSensitiveMultipartFieldsAndPreservesSafeParts() {
+        redactor.setCustomSensitiveFields(java.util.List.of("usr_pwd"));
+        String boundary = "----SecretScrubBoundary";
+        String body = "--" + boundary + "\r\n"
+                + "Content-Disposition: form-data; name=\"username\"\r\n\r\n"
+                + "alice\r\n"
+                + "--" + boundary + "\r\n"
+                + "Content-Disposition: form-data; name=\"usr_pwd\"\r\n\r\n"
+                + "multipart-password-secret\r\n"
+                + "--" + boundary + "\r\n"
+                + "Content-Disposition: form-data; name=\"csrf_token\"\r\n\r\n"
+                + "multipart-csrf-secret\r\n"
+                + "--" + boundary + "--\r\n";
+        String raw = "POST /upload HTTP/1.1\r\n"
+                + "Content-Type: multipart/form-data; boundary=\"" + boundary + "\"\r\n\r\n"
+                + body;
+
+        String result = redactor.redact(raw);
+
+        assertFalse(result.contains("multipart-password-secret"));
+        assertFalse(result.contains("multipart-csrf-secret"));
+        assertTrue(result.contains("name=\"username\"\r\n\r\nalice"));
+        assertTrue(result.contains("name=\"usr_pwd\"\r\n\r\n" + SecretRedactor.REDACTED));
+        assertTrue(result.contains("--" + boundary + "--"));
+    }
+
+    @Test
+    void redactsSensitiveXmlElementsCdataAndAttributesInResponses() {
+        redactor.setCustomSensitiveFields(java.util.List.of("usr_pwd"));
+        String body = "<response apiKey=\"xml-attribute-secret\">"
+                + "<username>alice</username>"
+                + "<usr_pwd>xml-element-secret</usr_pwd>"
+                + "<auth:csrf_token><![CDATA[xml-cdata-secret]]></auth:csrf_token>"
+                + "<privateKey><encoded>xml-nested-secret</encoded></privateKey>"
+                + "</response>";
+        String raw = "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\n\r\n" + body;
+
+        String result = redactor.redact(raw);
+
+        assertFalse(result.contains("xml-attribute-secret"));
+        assertFalse(result.contains("xml-element-secret"));
+        assertFalse(result.contains("xml-cdata-secret"));
+        assertFalse(result.contains("xml-nested-secret"));
+        assertTrue(result.contains("apiKey=\"" + SecretRedactor.REDACTED + "\""));
+        assertTrue(result.contains("<usr_pwd>" + SecretRedactor.REDACTED + "</usr_pwd>"));
+        assertTrue(result.contains("<username>alice</username>"));
+        assertTrue(result.contains("<privateKey>" + SecretRedactor.REDACTED + "</privateKey>"));
     }
 }

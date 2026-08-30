@@ -20,11 +20,24 @@ final class TrafficLoggerHttpHandler implements HttpHandler {
     private final MontoyaApi api;
     private final JsonlLogWriter logWriter;
     private final SecretRedactor redactor;
+    private volatile boolean compactMode;
+    private volatile boolean strictMode;
 
-    TrafficLoggerHttpHandler(MontoyaApi api, JsonlLogWriter logWriter, SecretRedactor redactor) {
+    TrafficLoggerHttpHandler(MontoyaApi api, JsonlLogWriter logWriter, SecretRedactor redactor,
+                             boolean compactMode, boolean strictMode) {
         this.api = api;
         this.logWriter = logWriter;
         this.redactor = redactor;
+        this.compactMode = compactMode;
+        this.strictMode = strictMode;
+    }
+
+    void setCompactMode(boolean compactMode) {
+        this.compactMode = compactMode;
+    }
+
+    void setStrictMode(boolean strictMode) {
+        this.strictMode = strictMode;
     }
 
     @Override
@@ -53,17 +66,45 @@ final class TrafficLoggerHttpHandler implements HttpHandler {
             return;
         }
 
-        String requestText = truncate(redactor.redact(request.toString()));
-        String responseText = truncate(redactor.redact(responseReceived.toString()));
-        String redactedUrl = redactor.redactUrl(url);
+        SecretRedactor.ExclusionConfig exclusionConfig = redactor.exclusionConfig();
+        SecretRedactor.RedactionResult redactedUrl = redactor.redactUrlWithMetadata(url);
+        boolean compactCapture = compactMode;
+        boolean strictCapture = strictMode;
+        PreparedMessage requestText = prepareMessage(
+                request.toString(), redactor, compactCapture, strictCapture);
+        PreparedMessage responseText = prepareMessage(
+                responseReceived.toString(), redactor, compactCapture, strictCapture);
+        String loggedUrl = redactedUrl.text();
+        int urlRedactions = redactedUrl.redactionCount();
+        if (strictCapture) {
+            StrictSafetySanitizer.UrlResult strictUrl =
+                    StrictSafetySanitizer.sanitizeUrl(loggedUrl);
+            loggedUrl = strictUrl.text();
+            urlRedactions += strictUrl.redactionCount();
+        }
+
+        TrafficJson.SafetyMetadata metadata = new TrafficJson.SafetyMetadata(
+                urlRedactions,
+                requestText.redactionCount(),
+                responseText.redactionCount(),
+                requestText.truncated(),
+                responseText.truncated(),
+                compactCapture,
+                strictCapture,
+                requestText.bodyOmitted(),
+                responseText.bodyOmitted(),
+                exclusionConfig.enabled(),
+                exclusionConfig.fields().size()
+        );
 
         String json = TrafficJson.build(
                 Instant.now().toString(),
                 request.method(),
-                redactedUrl,
+                loggedUrl,
                 responseReceived.statusCode(),
-                requestText,
-                responseText
+                requestText.text(),
+                responseText.text(),
+                metadata
         );
 
         logWriter.write(json);
@@ -84,12 +125,55 @@ final class TrafficLoggerHttpHandler implements HttpHandler {
         return false;
     }
 
-    private String truncate(String text) {
+    static TruncationResult truncate(String text) {
         byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
         if (bytes.length <= TrafficLoggerConfig.MAX_BODY_BYTES) {
-            return text;
+            return new TruncationResult(text, false);
         }
         String truncated = new String(bytes, 0, TrafficLoggerConfig.MAX_BODY_BYTES, StandardCharsets.UTF_8);
-        return truncated + TrafficLoggerConfig.TRUNCATION_MARKER;
+        return new TruncationResult(truncated + TrafficLoggerConfig.TRUNCATION_MARKER, true);
+    }
+
+    record TruncationResult(String text, boolean truncated) {
+    }
+
+    static PreparedMessage prepareMessage(String rawMessage, SecretRedactor redactor,
+                                          boolean compactCapture, boolean strictCapture) {
+        boolean bodyOmittedBeforeRedaction = false;
+        if (strictCapture) {
+            StrictSafetySanitizer.BodyOmissionResult omission =
+                    StrictSafetySanitizer.omitBody(rawMessage);
+            rawMessage = omission.text();
+            bodyOmittedBeforeRedaction = omission.bodyOmitted();
+        }
+
+        SecretRedactor.RedactionResult redacted = redactor.redactWithMetadata(rawMessage);
+        String text = redacted.text();
+        boolean compactTruncated = false;
+        if (compactCapture) {
+            HttpMessageCompactor.CompactResult compacted = HttpMessageCompactor.compact(text);
+            text = compacted.text();
+            compactTruncated = compacted.bodyTruncated();
+        }
+        int redactionCount = redacted.redactionCount();
+        boolean bodyOmitted = false;
+        if (strictCapture) {
+            StrictSafetySanitizer.MessageResult strict =
+                    StrictSafetySanitizer.sanitizeMessage(text);
+            text = strict.text();
+            redactionCount += strict.redactionCount();
+            bodyOmitted = bodyOmittedBeforeRedaction || strict.bodyOmitted();
+            if (bodyOmitted) {
+                compactTruncated = false;
+            }
+        }
+        TruncationResult capped = truncate(text);
+        return new PreparedMessage(
+                capped.text(), compactTruncated || capped.truncated(),
+                redactionCount, bodyOmitted);
+    }
+
+    record PreparedMessage(String text, boolean truncated, int redactionCount,
+                           boolean bodyOmitted) {
     }
 }

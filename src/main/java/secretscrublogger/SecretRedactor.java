@@ -4,12 +4,13 @@ import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Collection;
 import java.util.Set;
+import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -26,11 +27,32 @@ final class SecretRedactor {
 
     static final String REDACTED = "[REDACTED]";
 
+    /** The redacted text and the number of replacement markers introduced by this pass. */
+    record RedactionResult(String text, int redactionCount) {
+    }
+
+    record ExclusionConfig(boolean enabled, Set<String> fields) {
+    }
+
+    private record ExclusionPolicy(boolean enabled, Set<String> fields) {
+    }
+
     // Sensitive terms are matched as a "contains" check against the normalized (lowercased,
     // separator-stripped) key/header/parameter name, so e.g. "accessToken" and "api_key" match.
     private static final List<String> SENSITIVE_TERMS = List.of(
             "authorization", "authentication", "token", "accesstoken", "refreshtoken", "idtoken",
-            "jwt", "bearer", "apikey", "secret", "password", "cookie", "session", "credential"
+            "jwt", "bearer", "apikey", "secret", "password", "passcode", "cookie", "session",
+            "credential", "csrf", "xsrf", "clientsecret", "privatekey", "signingkey",
+            "encryptionkey", "recoverycode", "verificationcode", "mfacode", "totp"
+    );
+
+    private static final Set<String> SENSITIVE_EXACT_KEYS = Set.of(
+            "pin", "otp", "cvv", "cvc", "ssn"
+    );
+
+    private static final Set<String> SENSITIVE_PATH_MARKERS = Set.of(
+            "reset", "resetpassword", "passwordreset", "recover", "recovery", "verify",
+            "verification", "activate", "activation", "invite", "invitation", "magiclink"
     );
 
     // Three base64url segments separated by periods: the shape of a JWT, wherever it appears.
@@ -40,26 +62,71 @@ final class SecretRedactor {
     private static final Pattern BEARER_TOKEN_PATTERN =
             Pattern.compile("(?i)(Bearer\\s+)([A-Za-z0-9\\-_.+/=]{8,})");
 
+    private static final Pattern MULTIPART_BOUNDARY_PATTERN = Pattern.compile(
+            "(?i)(?:^|;)\\s*boundary\\s*=\\s*(?:\"([^\"]+)\"|([^;\\s]+))");
+
+    private static final Pattern MULTIPART_NAME_PATTERN = Pattern.compile(
+            "(?i)(?:^|;)\\s*name\\s*=\\s*(?:\"([^\"]*)\"|([^;\\s]*))");
+
+    private static final Pattern XML_ELEMENT_PATTERN = Pattern.compile(
+            "(?is)(<([A-Za-z_][\\w.:-]*)\\b[^>]*>)(.*?)(</\\2\\s*>)");
+
+    private static final Pattern XML_START_TAG_PATTERN = Pattern.compile(
+            "(?s)<[A-Za-z_][\\w.:-]*\\b[^>]*>");
+
+    private static final Pattern XML_ATTRIBUTE_PATTERN = Pattern.compile(
+            "(?s)([A-Za-z_][\\w.:-]*)(\\s*=\\s*)([\"'])(.*?)(\\3)");
+
     // Defensive fallback for bodies that cannot be structurally parsed: matches "key": "value" or
     // key=value where the key contains a sensitive term, quoted or not.
     private static final Pattern FALLBACK_KV_PATTERN = Pattern.compile(
-            "(?i)(\"?[\\w-]*(?:authorization|authenticat\\w*|accesstoken|refreshtoken|idtoken|token|jwt|"
-                    + "bearer|api[_-]?key|secret|password|cookie|session|credential)[\\w-]*\"?\\s*[:=]\\s*\"?)"
-                    + "([^\"'&,\\r\\n}]+)(\"?)");
+            "(?i)(\"?([\\w-]*(?:authorization|authenticat\\w*|accesstoken|refreshtoken|idtoken|token|jwt|"
+                    + "bearer|api[_-]?key|secret|password|cookie|session|credential)[\\w-]*)\"?"
+                    + "\\s*[:=]\\s*\"?)([^\"'&,\\r\\n}]+)(\"?)");
 
     private static final Pattern GENERIC_FALLBACK_KV_PATTERN = Pattern.compile(
             "(?i)(\"?([\\w-]+)\"?\\s*[:=]\\s*\"?)([^\"'&,\\r\\n}]+)(\"?)");
+
+    // Framework responses sometimes embed JSON inside JavaScript strings, escaping each quote
+    // with one or more backslashes. Treat those fields structurally during fallback scanning too.
+    private static final Pattern ESCAPED_QUOTED_KV_PATTERN = Pattern.compile(
+            "(?i)((?:\\\\+\"|&quot;)([\\w-]+)(?:\\\\+\"|&quot;)\\s*:\\s*"
+                    + "(?:\\\\+\"|&quot;))(.*?)((?:\\\\+\"|&quot;))");
 
     private static final List<String> KNOWN_COOKIE_ATTRIBUTES = List.of(
             "path", "domain", "expires", "maxage", "samesite", "secure", "httponly", "partitioned"
     );
 
     private volatile Set<String> customSensitiveFields = Set.of();
+    private volatile ExclusionPolicy exclusionPolicy = new ExclusionPolicy(false, Set.of());
 
     void setCustomSensitiveFields(Collection<String> fields) {
+        customSensitiveFields = normalizeFields(fields);
+    }
+
+    Set<String> customSensitiveFields() {
+        return customSensitiveFields;
+    }
+
+    void setExcludedFields(Collection<String> fields) {
+        Set<String> normalized = normalizeFields(fields);
+        ExclusionPolicy current = exclusionPolicy;
+        exclusionPolicy = new ExclusionPolicy(current.enabled(), normalized);
+    }
+
+    void setExclusionsEnabled(boolean enabled) {
+        ExclusionPolicy current = exclusionPolicy;
+        exclusionPolicy = new ExclusionPolicy(enabled, current.fields());
+    }
+
+    ExclusionConfig exclusionConfig() {
+        ExclusionPolicy current = exclusionPolicy;
+        return new ExclusionConfig(current.enabled(), current.fields());
+    }
+
+    private Set<String> normalizeFields(Collection<String> fields) {
         if (fields == null || fields.isEmpty()) {
-            customSensitiveFields = Set.of();
-            return;
+            return Set.of();
         }
         java.util.HashSet<String> normalized = new java.util.HashSet<>();
         for (String field : fields) {
@@ -68,7 +135,7 @@ final class SecretRedactor {
                 normalized.add(value);
             }
         }
-        customSensitiveFields = Set.copyOf(normalized);
+        return Set.copyOf(normalized);
     }
 
     /**
@@ -76,9 +143,18 @@ final class SecretRedactor {
      * + body).
      */
     String redact(String rawMessage) {
+        return redactWithMetadata(rawMessage).text();
+    }
+
+    RedactionResult redactWithMetadata(String rawMessage) {
         if (rawMessage == null) {
-            return null;
+            return new RedactionResult(null, 0);
         }
+        String redacted = redactMessage(rawMessage);
+        return resultFor(rawMessage, redacted);
+    }
+
+    private String redactMessage(String rawMessage) {
         String[] split = splitHeadAndBody(rawMessage);
         String head = split[0];
         String separator = split[1];
@@ -117,21 +193,89 @@ final class SecretRedactor {
         return newHead + separator + newBody;
     }
 
-    /** Redacts sensitive query parameters in a standalone URL or request-target for display/logging. */
+    /** Redacts sensitive path segments and query parameters in a URL or request-target. */
     String redactUrl(String url) {
+        return redactUrlWithMetadata(url).text();
+    }
+
+    RedactionResult redactUrlWithMetadata(String url) {
         if (url == null) {
-            return null;
+            return new RedactionResult(null, 0);
         }
+        String redacted = redactUrlValue(url);
+        return resultFor(url, redacted);
+    }
+
+    private String redactUrlValue(String url) {
         int hashIdx = url.indexOf('#');
         String beforeHash = hashIdx >= 0 ? url.substring(0, hashIdx) : url;
         String fragment = hashIdx >= 0 ? url.substring(hashIdx) : "";
         int queryIdx = beforeHash.indexOf('?');
         if (queryIdx < 0) {
-            return beforeHash + fragment;
+            return redactUrlPath(beforeHash) + fragment;
         }
-        String base = beforeHash.substring(0, queryIdx);
+        String base = redactUrlPath(beforeHash.substring(0, queryIdx));
         String query = beforeHash.substring(queryIdx + 1);
         return base + "?" + redactEncodedPairs(query, '&') + fragment;
+    }
+
+    private RedactionResult resultFor(String original, String redacted) {
+        int introducedMarkers = countOccurrences(redacted, REDACTED)
+                - countOccurrences(original, REDACTED);
+        return new RedactionResult(redacted, Math.max(0, introducedMarkers));
+    }
+
+    private static int countOccurrences(String value, String target) {
+        int count = 0;
+        int fromIndex = 0;
+        while (value != null && (fromIndex = value.indexOf(target, fromIndex)) >= 0) {
+            count++;
+            fromIndex += target.length();
+        }
+        return count;
+    }
+
+    private String redactUrlPath(String value) {
+        int pathStart = findPathStart(value);
+        if (pathStart < 0) {
+            return value;
+        }
+        String prefix = value.substring(0, pathStart);
+        String path = value.substring(pathStart);
+        String[] segments = path.split("/", -1);
+        boolean redactNext = false;
+        for (int i = 0; i < segments.length; i++) {
+            String segment = segments[i];
+            if (segment.isEmpty()) {
+                continue;
+            }
+            String decoded = decodeUrlComponent(segment);
+            if (redactNext || JWT_PATTERN.matcher(decoded).matches()) {
+                segments[i] = REDACTED;
+                redactNext = false;
+                continue;
+            }
+            redactNext = isSensitivePathMarker(decoded);
+        }
+        return prefix + String.join("/", segments);
+    }
+
+    private int findPathStart(String value) {
+        int scheme = value.indexOf("://");
+        if (scheme >= 0) {
+            return value.indexOf('/', scheme + 3);
+        }
+        return value.startsWith("/") ? 0 : -1;
+    }
+
+    private boolean isSensitivePathMarker(String segment) {
+        int matrixParameter = segment.indexOf(';');
+        String name = matrixParameter >= 0 ? segment.substring(0, matrixParameter) : segment;
+        if (isExcludedKey(name)) {
+            return false;
+        }
+        String normalized = normalizeKey(name);
+        return isSensitiveKey(name) || SENSITIVE_PATH_MARKERS.contains(normalized);
     }
 
     private String redactFirstLine(String line) {
@@ -151,6 +295,9 @@ final class SecretRedactor {
     }
 
     private String redactHeaderLine(String name, String value) {
+        if (isExcludedKey(name)) {
+            return value;
+        }
         String norm = normalizeKey(name);
         if (norm.equals("cookie") || norm.equals("setcookie")) {
             return redactCookieHeaderValue(norm, value);
@@ -201,7 +348,11 @@ final class SecretRedactor {
                 sb.append(part);
             } else {
                 String cookieName = trimmed.substring(0, eq);
-                sb.append(leadingWs).append(cookieName).append('=').append(REDACTED);
+                if (isExcludedKey(cookieName)) {
+                    sb.append(part);
+                } else {
+                    sb.append(leadingWs).append(cookieName).append('=').append(REDACTED);
+                }
             }
         }
         return sb.toString();
@@ -221,6 +372,9 @@ final class SecretRedactor {
         String leading = body.stripLeading();
         boolean looksJson = !leading.isEmpty() && (leading.charAt(0) == '{' || leading.charAt(0) == '[');
 
+        if (ct.contains("multipart/form-data")) {
+            return redactMultipartBody(contentType, body);
+        }
         if (ct.contains("json") || (ct.isEmpty() && looksJson)) {
             try {
                 Object parsed = MiniJson.parse(body);
@@ -232,7 +386,111 @@ final class SecretRedactor {
         if (ct.contains("x-www-form-urlencoded")) {
             return redactEncodedPairs(body, '&');
         }
+        if (ct.contains("xml")) {
+            return redactXml(body);
+        }
         return fallbackTextRedact(body);
+    }
+
+    private String redactMultipartBody(String contentType, String body) {
+        Matcher boundaryMatcher = MULTIPART_BOUNDARY_PATTERN.matcher(contentType);
+        if (!boundaryMatcher.find()) {
+            return fallbackTextRedact(body);
+        }
+        String boundary = boundaryMatcher.group(1) != null
+                ? boundaryMatcher.group(1)
+                : boundaryMatcher.group(2);
+        if (boundary == null || boundary.isEmpty()) {
+            return fallbackTextRedact(body);
+        }
+
+        String delimiter = "--" + boundary;
+        String[] parts = body.split(Pattern.quote(delimiter), -1);
+        StringBuilder result = new StringBuilder(body.length());
+        for (int i = 0; i < parts.length; i++) {
+            if (i > 0) {
+                result.append(delimiter);
+            }
+            result.append(redactMultipartPart(parts[i]));
+        }
+        return result.toString();
+    }
+
+    private String redactMultipartPart(String part) {
+        String[] split = splitHeadAndBody(part);
+        if (split[1].isEmpty()) {
+            return part;
+        }
+        String fieldName = multipartFieldName(split[0]);
+        if (fieldName != null && isExcludedKey(fieldName)) {
+            return part;
+        }
+        if (fieldName == null || !isSensitiveKey(fieldName)) {
+            return split[0] + split[1] + fallbackTextRedact(split[2]);
+        }
+
+        String trailingLineBreak = split[2].endsWith("\r\n")
+                ? "\r\n"
+                : split[2].endsWith("\n") ? "\n" : "";
+        return split[0] + split[1] + REDACTED + trailingLineBreak;
+    }
+
+    private String multipartFieldName(String partHeaders) {
+        String[] lines = partHeaders.split("\\r?\\n");
+        for (String line : lines) {
+            int colon = line.indexOf(':');
+            if (colon < 0 || !normalizeKey(line.substring(0, colon)).equals("contentdisposition")) {
+                continue;
+            }
+            Matcher nameMatcher = MULTIPART_NAME_PATTERN.matcher(line.substring(colon + 1));
+            if (nameMatcher.find()) {
+                return nameMatcher.group(1) != null ? nameMatcher.group(1) : nameMatcher.group(2);
+            }
+        }
+        return null;
+    }
+
+    private String redactXml(String body) {
+        ProtectedValues protectedValues = new ProtectedValues(body);
+        String result = redactXmlElements(body, protectedValues);
+        result = XML_START_TAG_PATTERN.matcher(result).replaceAll(match ->
+                Matcher.quoteReplacement(redactXmlAttributes(match.group(), protectedValues)));
+        return protectedValues.restore(scanAndRedactTokens(result));
+    }
+
+    private String redactXmlElements(String xml, ProtectedValues protectedValues) {
+        return XML_ELEMENT_PATTERN.matcher(xml).replaceAll(match -> {
+            String elementName = localXmlName(match.group(2));
+            if (isExcludedKey(elementName)) {
+                return Matcher.quoteReplacement(match.group(1)
+                        + protectedValues.protect(match.group(3)) + match.group(4));
+            }
+            if (!isSensitiveKey(elementName)) {
+                return Matcher.quoteReplacement(match.group(1)
+                        + redactXmlElements(match.group(3), protectedValues) + match.group(4));
+            }
+            return Matcher.quoteReplacement(match.group(1) + REDACTED + match.group(4));
+        });
+    }
+
+    private String redactXmlAttributes(String tag, ProtectedValues protectedValues) {
+        return XML_ATTRIBUTE_PATTERN.matcher(tag).replaceAll(match -> {
+            String attributeName = localXmlName(match.group(1));
+            if (isExcludedKey(attributeName)) {
+                return Matcher.quoteReplacement(match.group(1) + match.group(2)
+                        + match.group(3) + protectedValues.protect(match.group(4)) + match.group(5));
+            }
+            if (!isSensitiveKey(attributeName)) {
+                return Matcher.quoteReplacement(match.group());
+            }
+            return Matcher.quoteReplacement(match.group(1) + match.group(2)
+                    + match.group(3) + REDACTED + match.group(5));
+        });
+    }
+
+    private String localXmlName(String name) {
+        int colon = name.lastIndexOf(':');
+        return colon >= 0 ? name.substring(colon + 1) : name;
     }
 
     @SuppressWarnings("unchecked")
@@ -241,7 +499,9 @@ final class SecretRedactor {
             Map<String, Object> in = (Map<String, Object>) node;
             Map<String, Object> out = new LinkedHashMap<>(in.size());
             for (Map.Entry<String, Object> entry : in.entrySet()) {
-                if (isSensitiveKey(entry.getKey())) {
+                if (isExcludedKey(entry.getKey())) {
+                    out.put(entry.getKey(), entry.getValue());
+                } else if (isSensitiveKey(entry.getKey())) {
                     out.put(entry.getKey(), REDACTED);
                 } else {
                     out.put(entry.getKey(), redactJsonValue(entry.getValue()));
@@ -290,6 +550,9 @@ final class SecretRedactor {
         String rawName = pair.substring(0, eq);
         String rawValue = pair.substring(eq + 1);
         String decodedName = decodeUrlComponent(rawName);
+        if (isExcludedKey(decodedName)) {
+            return pair;
+        }
         if (isSensitiveKey(decodedName)) {
             return rawName + "=" + REDACTED;
         }
@@ -317,10 +580,30 @@ final class SecretRedactor {
 
     /** Defensive text-based redaction used only when a body cannot be structurally parsed. */
     private String fallbackTextRedact(String text) {
-        String result = FALLBACK_KV_PATTERN.matcher(text)
-                .replaceAll(mr -> Matcher.quoteReplacement(mr.group(1) + REDACTED + mr.group(3)));
+        ProtectedValues protectedValues = new ProtectedValues(text);
+        String result = ESCAPED_QUOTED_KV_PATTERN.matcher(text).replaceAll(mr -> {
+            if (isExcludedKey(mr.group(2))) {
+                return Matcher.quoteReplacement(mr.group(1)
+                        + protectedValues.protect(mr.group(3)) + mr.group(4));
+            }
+            if (!isSensitiveKey(mr.group(2))) {
+                return Matcher.quoteReplacement(mr.group());
+            }
+            return Matcher.quoteReplacement(mr.group(1) + REDACTED + mr.group(4));
+        });
+        result = FALLBACK_KV_PATTERN.matcher(result).replaceAll(mr -> {
+            if (isExcludedKey(mr.group(2))) {
+                return Matcher.quoteReplacement(mr.group(1)
+                        + protectedValues.protect(mr.group(3)) + mr.group(4));
+            }
+            return Matcher.quoteReplacement(mr.group(1) + REDACTED + mr.group(4));
+        });
         result = GENERIC_FALLBACK_KV_PATTERN.matcher(result).replaceAll(mr -> {
-            if (!customSensitiveFields.contains(normalizeKey(mr.group(2)))) {
+            if (isExcludedKey(mr.group(2))) {
+                return Matcher.quoteReplacement(mr.group(1)
+                        + protectedValues.protect(mr.group(3)) + mr.group(4));
+            }
+            if (!isSensitiveKey(mr.group(2))) {
                 return Matcher.quoteReplacement(mr.group());
             }
             return Matcher.quoteReplacement(mr.group(1) + REDACTED + mr.group(4));
@@ -328,7 +611,7 @@ final class SecretRedactor {
         result = BEARER_TOKEN_PATTERN.matcher(result)
                 .replaceAll(mr -> Matcher.quoteReplacement(mr.group(1) + REDACTED));
         result = JWT_PATTERN.matcher(result).replaceAll(Matcher.quoteReplacement(REDACTED));
-        return result;
+        return protectedValues.restore(result);
     }
 
     private static String decodeUrlComponent(String s) {
@@ -357,12 +640,20 @@ final class SecretRedactor {
         return sb.toString();
     }
 
+    private boolean isExcludedKey(String key) {
+        ExclusionPolicy current = exclusionPolicy;
+        return current.enabled() && current.fields().contains(normalizeKey(key));
+    }
+
     private boolean isSensitiveKey(String key) {
         String normalized = normalizeKey(key);
         if (normalized.isEmpty()) {
             return false;
         }
         if (customSensitiveFields.contains(normalized)) {
+            return true;
+        }
+        if (SENSITIVE_EXACT_KEYS.contains(normalized)) {
             return true;
         }
         for (String term : SENSITIVE_TERMS) {
@@ -386,5 +677,46 @@ final class SecretRedactor {
             return new String[]{raw.substring(0, lf), "\n\n", raw.substring(lf + 2)};
         }
         return new String[]{raw, "", ""};
+    }
+
+    private static final class ProtectedValues {
+        private final String source;
+        private final List<ProtectedValue> values = new ArrayList<>();
+        private String placeholderPrefix;
+
+        private ProtectedValues(String source) {
+            this.source = source;
+        }
+
+        private String protect(String value) {
+            ensurePlaceholderPrefix();
+            String placeholder = placeholderPrefix + values.size() + "__";
+            values.add(new ProtectedValue(placeholder, value));
+            return placeholder;
+        }
+
+        private void ensurePlaceholderPrefix() {
+            if (placeholderPrefix != null) {
+                return;
+            }
+            String candidate;
+            do {
+                candidate = "__SECRET_SCRUB_EXCLUDED_"
+                        + UUID.randomUUID().toString().replace("-", "") + "_";
+            } while (source.contains(candidate));
+            placeholderPrefix = candidate;
+        }
+
+        private String restore(String text) {
+            String result = text;
+            for (int i = values.size() - 1; i >= 0; i--) {
+                ProtectedValue value = values.get(i);
+                result = result.replace(value.placeholder(), value.original());
+            }
+            return result;
+        }
+    }
+
+    private record ProtectedValue(String placeholder, String original) {
     }
 }
